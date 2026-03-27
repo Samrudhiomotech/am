@@ -54,6 +54,7 @@ except ImportError:
 import threading
 
 
+# ── Colours ──────────────────────────────────────────────────────────────────
 BG      = "#F0F4F8"
 SURFACE = "#FFFFFF"
 BORDER  = "#CBD5E0"
@@ -66,7 +67,7 @@ TEXT    = "#1A202C"
 MUTED   = "#4A5568"
 LIGHT   = "#E2E8F0"
 
-
+# ── Constants ─────────────────────────────────────────────────────────────────
 GRID_ROWS    = 4
 GRID_COLS    = 4
 GRID_CELLS   = GRID_ROWS * GRID_COLS
@@ -93,6 +94,30 @@ CELL_COLORS = [
     "#E53E3E","#2B6CB0","#276749","#B45309",
     "#553C9A","#2C7A7B","#C05621","#2D3748",
 ]
+
+# ── FIX 1: Proper RTC configuration with TURN servers ─────────────────────────
+# STUN alone fails on most cloud deployments. TURN relays traffic through NAT.
+RTC_CONFIG = RTCConfiguration({
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {
+            "urls": ["turn:openrelay.metered.ca:80"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+        {
+            "urls": ["turn:openrelay.metered.ca:443?transport=tcp"],
+            "username": "openrelayproject",
+            "credential": "openrelayproject",
+        },
+    ]
+}) if WEBRTC_OK else None
 
 st.set_page_config(
     page_title="NeuroScan LBD",
@@ -133,13 +158,10 @@ def inject_css():
     div[data-testid="stMetricValue"]{{color:{TEXT}!important;font-family:'JetBrains Mono',monospace;font-size:1.2rem!important;}}
     div[data-testid="stMetricLabel"]{{color:{MUTED}!important;font-size:.72rem!important;}}
     .stProgress>div>div>div{{background:{ACCENT}!important;}}
-    /* Memory grid selected cells */
-    .cell-selected>button{{background:#3182CE!important;color:#fff!important;
-        border:2px solid #2B6CB0!important;font-weight:700!important;}}
     </style>""", unsafe_allow_html=True)
 
 
-
+# ── Enums & dataclasses ────────────────────────────────────────────────────────
 class AnomalyType(Enum):
     PROLONGED_FIXATION    = auto()
     SHORT_FIXATION        = auto()
@@ -230,7 +252,7 @@ class GazeSample:
     frame_index: int = 0
 
 
-
+# ── Anomaly Detector ───────────────────────────────────────────────────────────
 class AnomalyDetector:
     PROLONGED_MS     = 900.0
     SHORT_MS         = 80.0
@@ -404,7 +426,7 @@ class AnomalyDetector:
         self.events.append(ev)
 
 
-
+# ── Feature Extractor ──────────────────────────────────────────────────────────
 class FeatureExtractor:
     FIX_RADIUS = 0.05
     FIX_MIN_DUR = 0.10
@@ -445,7 +467,7 @@ class FeatureExtractor:
         }
 
 
-
+# ── Gaze Simulator ─────────────────────────────────────────────────────────────
 class GazeSimulator:
     @staticmethod
     def simulate(anchors, n_seconds=4.0, fps=30, noise=0.012):
@@ -469,7 +491,7 @@ class GazeSimulator:
         return pts
 
 
-
+# ── PyTorch model (optional) ───────────────────────────────────────────────────
 if TORCH_OK:
     class GazeRiskNet(nn.Module):
         def __init__(self, in_dim=8):
@@ -496,7 +518,7 @@ def _load_torch_model():
         return None
 
 
-
+# ── Risk Classifier ────────────────────────────────────────────────────────────
 @st.cache_resource
 def load_classifier():
     return RiskClassifier()
@@ -584,22 +606,28 @@ class RiskClassifier:
         }
 
 
-
+# ── FIX 2: Thread-safe CalibrationProcessor ────────────────────────────────────
+# Key fixes vs original:
+#   • mp.solutions.face_mesh instantiated INSIDE __init__ (not module-level)
+#   • All shared state guarded by threading.Lock()
+#   • recv() uses self.fm (instance), never a global pose/mesh object
+#   • get_state() and helper methods only read under lock
 if WEBRTC_OK and CV2_OK and MP_OK:
     class CalibrationProcessor(VideoProcessorBase):
         """
-        FIX 3: Redesigned processor — focus on STATIC fixation + EAR/blink/head-pose
-        concentration metrics (like eye.py), not moving-dot gaze tracking.
-        Detects: blink rate, EAR, head yaw, confidence, fixation stability.
+        Thread-safe FaceMesh processor.
+        Instantiates mediapipe inside __init__ so every processor instance
+        owns its own pipeline — no cross-thread state sharing.
         """
         L_IRIS=[468,469,470,471,472]; R_IRIS=[473,474,475,476,477]
-        L_OUT=33;L_IN=133;R_OUT=362;R_IN=263
-        L_TOP=159;L_BOT=145;R_TOP=386;R_BOT=374
-        NOSE=1; SMOOTH=6
+        L_OUT=33;  L_IN=133;  R_OUT=362; R_IN=263
+        L_TOP=159; L_BOT=145; R_TOP=386; R_BOT=374
+        NOSE=1;    SMOOTH=6
 
         def __init__(self):
+            # ── FIX: lock protects every shared attribute ──────────────────
             self.lock          = threading.Lock()
-            self.gaze_norm     = (0.5,0.5)
+            self.gaze_norm     = (0.5, 0.5)
             self.gaze_dir      = "CENTER"
             self.fixation_dur  = 0.0
             self.blink_count   = 0
@@ -608,151 +636,187 @@ if WEBRTC_OK and CV2_OK and MP_OK:
             self.confidence    = 0.0
             self.head_yaw      = 0.0
             self.history       = deque(maxlen=900)
-            # Concentration metrics (eye.py style)
-            self.ear_history   = deque(maxlen=150)   # ~5s at 30fps
+            self.ear_history   = deque(maxlen=150)
             self.blink_times: List[float] = []
             self._last_blink   = False
             self._fix_anchor   = None
             self._fix_start    = None
             self._bx           = deque(maxlen=self.SMOOTH)
             self._by           = deque(maxlen=self.SMOOTH)
+
+            # ── FIX: MediaPipe created per-instance, not at module level ───
             try:
-                fm = mp.solutions.face_mesh
-                self.fm = fm.FaceMesh(max_num_faces=1, refine_landmarks=True,
-                    min_detection_confidence=0.70, min_tracking_confidence=0.70)
+                fm_mod = mp.solutions.face_mesh
+                self.fm = fm_mod.FaceMesh(
+                    max_num_faces=1,
+                    refine_landmarks=True,
+                    min_detection_confidence=0.70,
+                    min_tracking_confidence=0.70,
+                )
             except Exception:
                 self.fm = None
 
+        # ── Static helpers (no shared state) ──────────────────────────────
         @staticmethod
-        def _ih(lm,iris,o,i_):
+        def _ih(lm, iris, o, i_):
             ix = float(np.mean([lm[k].x for k in iris]))
-            lo = min(lm[o].x,lm[i_].x); hi = max(lm[o].x,lm[i_].x)
-            return float(np.clip((ix-lo)/(hi-lo+1e-6),0,1))
+            lo = min(lm[o].x, lm[i_].x)
+            hi = max(lm[o].x, lm[i_].x)
+            return float(np.clip((ix - lo) / (hi - lo + 1e-6), 0, 1))
 
         @staticmethod
-        def _iv(lm,iris,t,b):
+        def _iv(lm, iris, t, b):
             iy = float(np.mean([lm[k].y for k in iris]))
-            t_ = min(lm[t].y,lm[b].y); b_ = max(lm[t].y,lm[b].y)
-            return float(np.clip((iy-t_)/(b_-t_+1e-6),0,1))
+            t_ = min(lm[t].y, lm[b].y)
+            b_ = max(lm[t].y, lm[b].y)
+            return float(np.clip((iy - t_) / (b_ - t_ + 1e-6), 0, 1))
 
         @staticmethod
-        def _ear(lm,top,bot,ou,in_):
-            return abs(lm[top].y-lm[bot].y)/(abs(lm[ou].x-lm[in_].x)+1e-6)
+        def _ear(lm, top, bot, ou, in_):
+            return abs(lm[top].y - lm[bot].y) / (abs(lm[ou].x - lm[in_].x) + 1e-6)
 
+        # ── FIX: recv() is the ONLY method that touches self.fm ───────────
         def recv(self, frame):
-            img = cv2.flip(frame.to_ndarray(format="bgr24"),1)
-            fh,fw = img.shape[:2]
-            now   = time.time()
+            img = cv2.flip(frame.to_ndarray(format="bgr24"), 1)
+            fh, fw = img.shape[:2]
+            now = time.time()
+
             if self.fm is None:
+                cv2.putText(img, "MediaPipe unavailable", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
                 return av.VideoFrame.from_ndarray(img, format="bgr24")
-            res = self.fm.process(cv2.cvtColor(img,cv2.COLOR_BGR2RGB))
+
+            # process_rgb must NOT be called with the lock held —
+            # FaceMesh is not thread-safe across instances but is fine
+            # within a single instance as recv() is serialised per processor.
+            rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            rgb.flags.writeable = False
+            res = self.fm.process(rgb)
+            rgb.flags.writeable = True
+
             if not (res and res.multi_face_landmarks):
-                with self.lock: self.confidence = 0.0
-                # Draw "no face" notice on frame
-                cv2.putText(img, "No face detected", (10,30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,80,255), 2)
+                with self.lock:
+                    self.confidence = 0.0
+                cv2.putText(img, "No face detected", (10, 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 80, 255), 2)
                 return av.VideoFrame.from_ndarray(img, format="bgr24")
 
             lm = res.multi_face_landmarks[0].landmark
-            lh = self._ih(lm,self.L_IRIS,self.L_OUT,self.L_IN)
-            rh = self._ih(lm,self.R_IRIS,self.R_OUT,self.R_IN)
-            lv = self._iv(lm,self.L_IRIS,self.L_TOP,self.L_BOT)
-            rv = self._iv(lm,self.R_IRIS,self.R_TOP,self.R_BOT)
-            self._bx.append((lh+rh)/2); self._by.append((lv+rv)/2)
-            sh = float(np.mean(self._bx)); sv = float(np.mean(self._by))
 
-            l_ear = self._ear(lm,self.L_TOP,self.L_BOT,self.L_OUT,self.L_IN)
-            r_ear = self._ear(lm,self.R_TOP,self.R_BOT,self.R_OUT,self.R_IN)
+            # ── Gaze computation (local vars, no lock needed yet) ──────────
+            lh = self._ih(lm, self.L_IRIS, self.L_OUT, self.L_IN)
+            rh = self._ih(lm, self.R_IRIS, self.R_OUT, self.R_IN)
+            lv = self._iv(lm, self.L_IRIS, self.L_TOP, self.L_BOT)
+            rv = self._iv(lm, self.R_IRIS, self.R_TOP, self.R_BOT)
+
+            self._bx.append((lh + rh) / 2)
+            self._by.append((lv + rv) / 2)
+            sh = float(np.mean(self._bx))
+            sv = float(np.mean(self._by))
+
+            l_ear   = self._ear(lm, self.L_TOP, self.L_BOT, self.L_OUT, self.L_IN)
+            r_ear   = self._ear(lm, self.R_TOP, self.R_BOT, self.R_OUT, self.R_IN)
             avg_ear = (l_ear + r_ear) / 2.0
-            self.ear_history.append(avg_ear)
 
-            # Blink detection
+            # Blink detection (local flag, then lock for shared lists)
             blink = avg_ear < 0.21
             if blink and not self._last_blink:
                 with self.lock:
                     self.blink_count += 1
                     self.blink_times.append(now)
+                    self.ear_history.append(avg_ear)
+            else:
+                with self.lock:
+                    self.ear_history.append(avg_ear)
             self._last_blink = blink
 
-            # Fixation duration (static hold)
+            # Fixation anchor (uses self._fix_* which are only touched in recv)
             if self._fix_anchor is None:
-                self._fix_anchor = (sh, sv); self._fix_start = now
-            elif math.hypot(sh-self._fix_anchor[0], sv-self._fix_anchor[1]) > 0.06:
-                self._fix_anchor = (sh, sv); self._fix_start = now
+                self._fix_anchor = (sh, sv)
+                self._fix_start  = now
+            elif math.hypot(sh - self._fix_anchor[0], sv - self._fix_anchor[1]) > 0.06:
+                self._fix_anchor = (sh, sv)
+                self._fix_start  = now
 
             # Head yaw estimate
             nose_x  = lm[self.NOSE].x
             eye_mid = (lm[self.L_OUT].x + lm[self.R_OUT].x) / 2
             yaw_est = (nose_x - eye_mid) * 110
 
-            gdir_h = "LEFT" if sh<.38 else ("RIGHT" if sh>.62 else "CENTER")
-            gdir_v = "UP"   if sv<.33 else ("DOWN"  if sv>.67 else "CENTER")
+            gdir_h = "LEFT"  if sh < .38 else ("RIGHT" if sh > .62 else "CENTER")
+            gdir_v = "UP"    if sv < .33 else ("DOWN"  if sv > .67 else "CENTER")
+            fix_dur = round(now - (self._fix_start or now), 2)
 
+            # ── Write shared state under lock ──────────────────────────────
             with self.lock:
                 self.gaze_norm   = (sh, sv)
                 self.gaze_dir    = f"{gdir_h}-{gdir_v}"
-                self.fixation_dur = round(now-(self._fix_start or now), 2)
+                self.fixation_dur = fix_dur
                 self.left_ear    = float(l_ear)
                 self.right_ear   = float(r_ear)
                 self.confidence  = 0.95
                 self.head_yaw    = float(yaw_est)
                 self.history.append((float(sh), float(sv)))
 
-
-            # Draw iris rings
+            # ── Overlay drawing ────────────────────────────────────────────
             for iris_pts in [self.L_IRIS, self.R_IRIS]:
-                ix_px = int(np.mean([lm[k].x for k in iris_pts])*fw)
-                iy_px = int(np.mean([lm[k].y for k in iris_pts])*fh)
-                cv2.circle(img,(ix_px,iy_px), 18, (200,220,255), 1)
-                cv2.circle(img,(ix_px,iy_px), 9,  (0,200,255),  1)
-                cv2.circle(img,(ix_px,iy_px), 5,  (0,220,255), -1)
-                cv2.circle(img,(ix_px,iy_px), 2,  (8,8,12),    -1)
+                ix_px = int(np.mean([lm[k].x for k in iris_pts]) * fw)
+                iy_px = int(np.mean([lm[k].y for k in iris_pts]) * fh)
+                cv2.circle(img, (ix_px, iy_px), 18, (200, 220, 255), 1)
+                cv2.circle(img, (ix_px, iy_px),  9, (0, 200, 255),   1)
+                cv2.circle(img, (ix_px, iy_px),  5, (0, 220, 255),  -1)
+                cv2.circle(img, (ix_px, iy_px),  2, (8,   8,  12),  -1)
 
-            # EAR bar (bottom-left, eye.py style)
-            bar_x, bar_y = 10, fh-60
+            bar_x, bar_y = 10, fh - 60
             bar_len = int(np.clip(avg_ear / 0.40, 0, 1) * 180)
-            ear_col = (0,200,80) if avg_ear >= 0.21 else (0,80,255)
-            cv2.rectangle(img,(bar_x, bar_y),(bar_x+180,bar_y+14),(30,36,50),-1)
-            cv2.rectangle(img,(bar_x, bar_y),(bar_x+bar_len,bar_y+14),ear_col,-1)
-            cv2.putText(img,f"EAR {avg_ear:.3f}{'  BLINK' if avg_ear<0.21 else ''}",
-                        (bar_x, bar_y-4), cv2.FONT_HERSHEY_SIMPLEX, 0.44, ear_col, 1)
+            ear_col = (0, 200, 80) if avg_ear >= 0.21 else (0, 80, 255)
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + 180, bar_y + 14), (30, 36, 50), -1)
+            cv2.rectangle(img, (bar_x, bar_y), (bar_x + bar_len, bar_y + 14), ear_col, -1)
+            cv2.putText(img,
+                        f"EAR {avg_ear:.3f}{'  BLINK' if avg_ear < 0.21 else ''}",
+                        (bar_x, bar_y - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.44, ear_col, 1)
 
-            # Head yaw indicator
-            yaw_col = (0,80,255) if abs(yaw_est)>22 else (0,200,80)
+            yaw_col = (0, 80, 255) if abs(yaw_est) > 22 else (0, 200, 80)
             cv2.putText(img, f"YAW {yaw_est:+.0f}deg",
-                        (bar_x, bar_y+32), cv2.FONT_HERSHEY_SIMPLEX, 0.44, yaw_col, 1)
-
-            # Confidence badge
-            cv2.putText(img, "TRACKING OK", (fw-130, 26),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0,200,80), 1)
+                        (bar_x, bar_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.44, yaw_col, 1)
+            cv2.putText(img, "TRACKING OK", (fw - 130, 26),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 200, 80), 1)
 
             return av.VideoFrame.from_ndarray(img, format="bgr24")
 
-        def get_state(self):
+        def get_state(self) -> dict:
+            """Thread-safe snapshot of all display metrics."""
             with self.lock:
-                return {k:getattr(self,k) for k in
-                    ("gaze_norm","gaze_dir","fixation_dur","blink_count",
-                     "left_ear","right_ear","confidence","head_yaw")}
+                return {
+                    "gaze_norm":    self.gaze_norm,
+                    "gaze_dir":     self.gaze_dir,
+                    "fixation_dur": self.fixation_dur,
+                    "blink_count":  self.blink_count,
+                    "left_ear":     self.left_ear,
+                    "right_ear":    self.right_ear,
+                    "confidence":   self.confidence,
+                    "head_yaw":     self.head_yaw,
+                }
 
         def get_blink_rate_live(self) -> float:
-            """Blink rate per minute from recent blinks (eye.py style)."""
+            """Blink rate per minute from recent blinks."""
             with self.lock:
-                recent = [b for b in self.blink_times if b > time.time()-60]
+                recent = [b for b in self.blink_times if b > time.time() - 60]
                 if len(recent) < 2:
                     return 0.0
-                dur = (recent[-1]-recent[0])/60.0
-                return round(len(recent)/max(dur,.01), 1)
+                dur = (recent[-1] - recent[0]) / 60.0
+                return round(len(recent) / max(dur, 0.01), 1)
 
         def get_ear_stability(self) -> float:
-            """Std-dev of EAR over last 5s — low = stable open eyes."""
+            """Std-dev of EAR over last 5 s — low = stable open eyes."""
             with self.lock:
                 if len(self.ear_history) < 10:
                     return 0.0
                 return float(np.std(list(self.ear_history)))
 
 
-
-STEPS = ["Welcome","Eye Baseline","Memory Task","Saccade Task","Report"]
+# ── Navigation helpers ─────────────────────────────────────────────────────────
+STEPS = ["Welcome", "Eye Baseline", "Memory Task", "Saccade Task", "Report"]
 
 
 def init_state():
@@ -766,7 +830,7 @@ def init_state():
         sacc_side=None, sacc_correct=None,
         sacc_phase="fixation", sacc_phase_start=None, sacc_last={},
     )
-    for k,v in defs.items():
+    for k, v in defs.items():
         if k not in st.session_state:
             st.session_state[k] = v
     if st.session_state.det is None:
@@ -775,7 +839,6 @@ def init_state():
 
 def nav(page):
     st.session_state.page = page
-
 
 
 def hdr(subtitle=""):
@@ -798,9 +861,9 @@ def hdr(subtitle=""):
 
 def show_steps(active):
     cols = st.columns(len(STEPS))
-    for i,(col,lbl) in enumerate(zip(cols,STEPS)):
-        c = ACCENT if i==active-1 else (SAFE if i<active-1 else BORDER)
-        t = TEXT   if i==active-1 else (MUTED if i<active-1 else BORDER)
+    for i, (col, lbl) in enumerate(zip(cols, STEPS)):
+        c = ACCENT if i == active-1 else (SAFE if i < active-1 else BORDER)
+        t = TEXT   if i == active-1 else (MUTED if i < active-1 else BORDER)
         with col:
             st.markdown(
                 f'<div style="text-align:center;padding:2px 0;">'
@@ -811,21 +874,21 @@ def show_steps(active):
     st.markdown("<br>", unsafe_allow_html=True)
 
 
-def grid_svg_bg(w,h,step=50):
-    p=[]
-    for gx in range(0,w+1,step):
+def grid_svg_bg(w, h, step=50):
+    p = []
+    for gx in range(0, w+1, step):
         p.append(f'<line x1="{gx}" y1="0" x2="{gx}" y2="{h}" stroke="#E2E8F0" stroke-width="0.8"/>')
-    for gy in range(0,h+1,step):
+    for gy in range(0, h+1, step):
         p.append(f'<line x1="0" y1="{gy}" x2="{w}" y2="{gy}" stroke="#E2E8F0" stroke-width="0.8"/>')
     return "".join(p)
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 1: WELCOME
-
+# ══════════════════════════════════════════════════════════════════════════════
 def page_welcome():
     hdr()
-    L,R = st.columns([3,2], gap="large")
+    L, R = st.columns([3, 2], gap="large")
     with L:
         st.markdown(f"""
         <div style="padding:.6rem 0 .8rem;">
@@ -845,7 +908,7 @@ def page_welcome():
             (ACCENT2, "Antisaccade",  "Inhibition task, 5 trials",      "STEP 3"),
             (WARN,    "Risk Report",  "Ensemble ML classification",     "STEP 4"),
         ]
-        for col,(c,ttl,dsc,tag) in zip(st.columns(4), cards):
+        for col, (c, ttl, dsc, tag) in zip(st.columns(4), cards):
             with col:
                 st.markdown(f"""
                 <div class="card" style="border-top:3px solid {c};">
@@ -859,41 +922,44 @@ def page_welcome():
         pid = st.text_input("Participant ID", value=st.session_state.participant)
         age = st.number_input("Age", min_value=18, max_value=110, value=st.session_state.age)
         st.markdown('</div>', unsafe_allow_html=True)
+
         cam_ok = WEBRTC_OK and CV2_OK and MP_OK
         deps = [
             ("opencv-python-headless", CV2_OK,   "pip install opencv-python-headless"),
             ("mediapipe",              MP_OK,     "pip install mediapipe==0.10.14"),
             ("streamlit-webrtc + av",  WEBRTC_OK, "pip install streamlit-webrtc av"),
-            ("best_gaze_model.pth",    os.path.exists("best_gaze_model.pth"),"place in working dir"),
+            ("best_gaze_model.pth",    os.path.exists("best_gaze_model.pth"), "place in working dir"),
         ]
         rows = "".join(
             f'<div style="display:flex;align-items:center;gap:7px;padding:2px 0;">'
             f'<div style="width:7px;height:7px;border-radius:50%;background:{SAFE if ok else WARN};flex-shrink:0;"></div>'
             f'<div style="font-family:JetBrains Mono,monospace;font-size:.72rem;color:{TEXT};flex:1;">{pkg}</div>'
             f'<div style="font-size:.68rem;color:{SAFE if ok else WARN};">{"Ready" if ok else note}</div></div>'
-            for pkg,ok,note in deps)
+            for pkg, ok, note in deps)
         card_bg = "#F0FFF4" if cam_ok else "#FFFAF0"
         card_bd = SAFE      if cam_ok else WARN
-        msg     = "Live webcam ready." if cam_ok else "Dependencies missing - simulation mode."
+        msg     = "Live webcam ready." if cam_ok else "Dependencies missing — simulation mode."
         st.markdown(
             f'<div style="background:{card_bg};border:1.5px solid {card_bd}44;border-radius:6px;'
             f'padding:.55rem .8rem;margin-bottom:.55rem;">'
             f'<div style="font-weight:600;font-size:.80rem;color:{card_bd};margin-bottom:.35rem;">{msg}</div>'
             f'{rows}</div>', unsafe_allow_html=True)
+
         if st.button("Begin Assessment", use_container_width=True):
             st.session_state.participant = pid or "P001"
             st.session_state.age = int(age)
             nav("calibration"); st.rerun()
+
         st.markdown(
             f'<div style="background:#FFFAF0;border:1px solid {WARN}44;border-radius:5px;'
             f'padding:.5rem .7rem;font-size:.74rem;color:{WARN};line-height:1.55;">'
-            f'Neuroscience</div>',
+            f'⚠  Research use only. Not a clinical diagnostic tool.</div>',
             unsafe_allow_html=True)
 
 
-
-
-
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2: EYE BASELINE / CALIBRATION
+# ══════════════════════════════════════════════════════════════════════════════
 def page_calibration():
     hdr(f"Participant: {st.session_state.participant}")
     show_steps(2)
@@ -907,8 +973,7 @@ def page_calibration():
                 A 30-second session that captures your eye physiology at rest.
                 <strong>Keep your gaze fixed on the central cross</strong> on screen.
                 The system measures blink rate, EAR (eye aspect ratio), head pose, and
-                fixation stability — the same concentration metrics used in eye.py — to
-                build a resting-state baseline for LBD biomarker detection.
+                fixation stability to build a resting-state baseline for LBD biomarker detection.
             </p>
             <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;">
                 <div><b style="font-size:.82rem;">1. Allow camera</b>
@@ -921,7 +986,20 @@ def page_calibration():
                     <div style="font-size:.73rem;color:{MUTED};">EAR and blink rate recorded.</div></div>
             </div>
         </div>""", unsafe_allow_html=True)
-        c1,c2,c3 = st.columns([1,1,1])
+
+        # ── FIX 3: Show browser-permission and TURN troubleshooting tips ──
+        st.markdown(f"""
+        <div style="background:#EBF8FF;border:1px solid #90CDF4;border-radius:6px;
+                    padding:.6rem .9rem;margin-bottom:.65rem;font-size:.78rem;color:{ACCENT};">
+            <b>Camera checklist</b><br>
+            1. Click <b>Allow</b> when the browser asks for camera permission.<br>
+            2. Make sure the page is served over <b>HTTPS</b> (required for WebRTC).<br>
+            3. If the stream does not start after 10 s, try a different browser
+               (Chrome / Edge work best) or reload the page.<br>
+            4. A TURN relay server is pre-configured — most NAT/firewall issues are handled automatically.
+        </div>""", unsafe_allow_html=True)
+
+        c1, c2, c3 = st.columns([1, 1, 1])
         with c2:
             if st.button("Start Eye Baseline", use_container_width=True):
                 st.session_state.cal_start   = time.time()
@@ -931,22 +1009,21 @@ def page_calibration():
 
     elapsed = time.time() - st.session_state.cal_start
     rem     = max(0.0, EYE_CAL_SEC - elapsed)
-    pct     = min(1.0, elapsed/EYE_CAL_SEC)
+    pct     = min(1.0, elapsed / EYE_CAL_SEC)
 
-    cam_col, info_col = st.columns([3,2], gap="large")
-
+    cam_col, info_col = st.columns([3, 2], gap="large")
 
     with cam_col:
         st.markdown(f'<div class="sec">LIVE EAR  ·  BLINK  ·  HEAD POSE TRACKING</div>',
                     unsafe_allow_html=True)
 
         if WEBRTC_OK and CV2_OK and MP_OK:
+            # ── FIX 1 applied: RTC_CONFIG includes TURN servers ───────────
             ctx = webrtc_streamer(
                 key="cal",
                 video_processor_factory=CalibrationProcessor,
-                rtc_configuration=RTCConfiguration(
-                    {"iceServers":[{"urls":["stun:stun.l.google.com:19302"]}]}),
-                media_stream_constraints={"video":True,"audio":False},
+                rtc_configuration=RTC_CONFIG,           # ← TURN-enabled config
+                media_stream_constraints={"video": True, "audio": False},
                 async_processing=True,
             )
             if ctx.video_processor:
@@ -956,7 +1033,8 @@ def page_calibration():
                 if hist:
                     st.session_state.cal_samples.extend(hist[-6:])
                     st.session_state.gaze_log.extend(hist[-6:])
-                gx,gy = st_["gaze_norm"]
+
+                gx, gy = st_["gaze_norm"]
                 samp = GazeSample(
                     timestamp=time.time(), gaze_x=gx, gaze_y=gy,
                     left_ear=st_["left_ear"], right_ear=st_["right_ear"],
@@ -968,23 +1046,21 @@ def page_calibration():
                 bc   = st_["blink_count"]
                 fix  = st_["fixation_dur"]
                 yaw  = st_["head_yaw"]
-                ear  = (st_["left_ear"]+st_["right_ear"])/2
+                ear  = (st_["left_ear"] + st_["right_ear"]) / 2
                 br   = vp.get_blink_rate_live()
                 stab = det.get_fixation_stability()
 
                 ear_c  = DANGER if ear < .18 else SAFE
                 yaw_c  = DANGER if abs(yaw) > 22 else SAFE
-                stab_c = DANGER if stab>.65 else (WARN if stab>.35 else SAFE)
+                stab_c = DANGER if stab > .65 else (WARN if stab > .35 else SAFE)
                 br_c   = DANGER if (br < 3 or br > 30) else SAFE
 
-                # 4-metric top row
-                m1,m2,m3,m4 = st.columns(4)
-                with m1: st.metric("EAR", f"{ear:.3f}")
-                with m2: st.metric("Blink Rate", f"{br:.1f}/min")
-                with m3: st.metric("Head Yaw", f"{yaw:+.0f}°")
-                with m4: st.metric("Blinks", str(bc))
+                m1, m2, m3, m4 = st.columns(4)
+                with m1: st.metric("EAR",        f"{ear:.3f}")
+                with m2: st.metric("Blink Rate",  f"{br:.1f}/min")
+                with m3: st.metric("Head Yaw",    f"{yaw:+.0f}°")
+                with m4: st.metric("Blinks",      str(bc))
 
-                # Concentration panel (eye.py style cards)
                 st.markdown(f"""
                 <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:7px;margin-top:.5rem;">
                     <div class="card" style="padding:.6rem;text-align:center;">
@@ -1009,11 +1085,10 @@ def page_calibration():
                     </div>
                 </div>""", unsafe_allow_html=True)
 
-                # Latest anomaly flash
                 if det.events:
                     ev   = det.events[-1]
-                    scol = {"CRITICAL":DANGER,"HIGH":WARN,"MEDIUM":ACCENT,"LOW":MUTED}
-                    sbg  = {"CRITICAL":"#FFF5F5","HIGH":"#FFFAF0","MEDIUM":"#EBF8FF","LOW":LIGHT}
+                    scol = {"CRITICAL": DANGER, "HIGH": WARN, "MEDIUM": ACCENT, "LOW": MUTED}
+                    sbg  = {"CRITICAL": "#FFF5F5","HIGH": "#FFFAF0","MEDIUM": "#EBF8FF","LOW": LIGHT}
                     tc_  = scol.get(ev.severity, MUTED)
                     bg_  = sbg.get(ev.severity, LIGHT)
                     lbd_ = "  [LBD]" if ev.is_lbd_biomarker else ""
@@ -1025,61 +1100,56 @@ def page_calibration():
                         f'  val={ev.measured_value:.3f} {ev.unit}{lbd_}</div>',
                         unsafe_allow_html=True)
             else:
-                st.info("Click START above to begin iris tracking.")
-
+                # ── FIX 4: Helpful message while WebRTC is connecting ──────
+                st.info(
+                    "📷  Waiting for camera stream…\n\n"
+                    "If the video does not appear within 10 seconds:\n"
+                    "- Check that you clicked **Allow** on the browser camera prompt\n"
+                    "- Try reloading the page\n"
+                    "- Ensure you are on HTTPS"
+                )
         else:
-            # Simulation mode — simulate stable fixation at centre
+            # Simulation mode
             sim_pts = GazeSimulator.simulate([(0.5, 0.5)], 0.28, 10, 0.006)
             st.session_state.cal_samples.extend(sim_pts)
             st.session_state.gaze_log.extend(sim_pts)
-            for px_,py_ in sim_pts[-3:]:
+            for px_, py_ in sim_pts[-3:]:
                 samp = GazeSample(
                     timestamp=time.time(), gaze_x=px_, gaze_y=py_,
-                    left_ear=0.28+random.gauss(0,.01),
-                    right_ear=0.28+random.gauss(0,.01),
-                    head_pitch=0, head_yaw=float(random.gauss(0,2.5)), head_roll=0,
+                    left_ear=0.28+random.gauss(0, .01),
+                    right_ear=0.28+random.gauss(0, .01),
+                    head_pitch=0, head_yaw=float(random.gauss(0, 2.5)), head_roll=0,
                     confidence=0.88, frame_index=len(st.session_state.cal_samples))
                 det.process_sample(samp)
-            sb  = int(elapsed*0.27)
-            br  = sb/max(elapsed,1)*60
-            ear_sim = 0.28 + random.gauss(0,.005)
-            stab = det.get_fixation_stability()
-            stab_c = DANGER if stab>.65 else (WARN if stab>.35 else SAFE)
-            ear_c  = SAFE
+            sb       = int(elapsed * 0.27)
+            br       = sb / max(elapsed, 1) * 60
+            ear_sim  = 0.28 + random.gauss(0, .005)
+            stab     = det.get_fixation_stability()
+            stab_c   = DANGER if stab > .65 else (WARN if stab > .35 else SAFE)
 
             st.markdown(
                 f'<div style="background:#EBF8FF;border:1px solid #90CDF4;border-radius:6px;'
                 f'padding:.65rem;margin-bottom:.45rem;font-size:.82rem;color:{ACCENT};">'
                 f'Simulation mode — concentration metrics being generated at centre fixation.</div>',
                 unsafe_allow_html=True)
-            m1,m2,m3,m4 = st.columns(4)
-            with m1: st.metric("EAR (sim)", f"{ear_sim:.3f}")
+            m1, m2, m3, m4 = st.columns(4)
+            with m1: st.metric("EAR (sim)",  f"{ear_sim:.3f}")
             with m2: st.metric("Blink Rate", f"{br:.1f}/min")
-            with m3: st.metric("Stability", f"{(1-stab)*100:.0f}%")
-            with m4: st.metric("Anomalies", str(len(det.events)))
-
+            with m3: st.metric("Stability",  f"{(1-stab)*100:.0f}%")
+            with m4: st.metric("Anomalies",  str(len(det.events)))
 
     with info_col:
-        st.markdown(f'<div class="sec">CONCENTRATION  +  EYE PHYSIOLOGY</div>',
-                    unsafe_allow_html=True)
+        st.markdown(f'<div class="sec">CONCENTRATION  +  EYE PHYSIOLOGY</div>', unsafe_allow_html=True)
 
-        # Static fixation cross SVG (replaces moving-dot)
         cross_svg = f"""
         <div style="display:flex;justify-content:center;margin-bottom:.7rem;">
         <svg width="280" height="180"
              style="background:#F7FAFC;border:1.5px solid {BORDER};border-radius:8px;">
-          <!-- grid -->
-          {"".join(
-              f'<line x1="{gx}" y1="0" x2="{gx}" y2="180" stroke="#E2E8F0" stroke-width="0.7"/>'
-              for gx in range(0,281,40))}
-          {"".join(
-              f'<line x1="0" y1="{gy}" x2="280" y2="{gy}" stroke="#E2E8F0" stroke-width="0.7"/>'
-              for gy in range(0,181,40))}
-          <!-- fixation cross -->
+          {"".join(f'<line x1="{gx}" y1="0" x2="{gx}" y2="180" stroke="#E2E8F0" stroke-width="0.7"/>' for gx in range(0,281,40))}
+          {"".join(f'<line x1="0" y1="{gy}" x2="280" y2="{gy}" stroke="#E2E8F0" stroke-width="0.7"/>' for gy in range(0,181,40))}
           <line x1="100" y1="90" x2="180" y2="90" stroke="{TEXT}" stroke-width="3"/>
           <line x1="140" y1="50" x2="140" y2="130" stroke="{TEXT}" stroke-width="3"/>
           <circle cx="140" cy="90" r="5" fill="{ACCENT}"/>
-          <!-- pulsing ring -->
           <circle cx="140" cy="90" r="18" fill="none" stroke="{ACCENT}44" stroke-width="2"/>
           <text x="140" y="158" text-anchor="middle"
                 font-size="11" font-family="monospace" fill="{MUTED}">
@@ -1089,10 +1159,9 @@ def page_calibration():
         </div>"""
         st.markdown(cross_svg, unsafe_allow_html=True)
 
-        # Blink-rate bar
-        br_now = det.get_blink_rate()
-        br_c   = DANGER if br_now < 3 else (WARN if br_now > 25 else SAFE)
-        br_norm = min(1.0, br_now/25.0)
+        br_now  = det.get_blink_rate()
+        br_c    = DANGER if br_now < 3 else (WARN if br_now > 25 else SAFE)
+        br_norm = min(1.0, br_now / 25.0)
         st.markdown(
             f'<div style="margin-bottom:.55rem;">'
             f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:.66rem;'
@@ -1103,18 +1172,16 @@ def page_calibration():
             f'Normal 3–25 / min  |  &lt;3 = ABSENT_BLINK anomaly</div></div>',
             unsafe_allow_html=True)
 
-        # Anomaly counts
         lbd_n  = sum(1 for e in det.events if e.is_lbd_biomarker)
         sev_c  = Counter(e.severity for e in det.events)
         risk   = det.get_risk_score()
-        risk_c = DANGER if risk>.5 else (WARN if risk>.25 else SAFE)
-        a1,a2,a3,a4 = st.columns(4)
+        risk_c = DANGER if risk > .5 else (WARN if risk > .25 else SAFE)
+        a1, a2, a3, a4 = st.columns(4)
         with a1: st.metric("Total",     str(len(det.events)))
         with a2: st.metric("LBD Flags", str(lbd_n))
         with a3: st.metric("High+",     str(sev_c.get("HIGH",0)+sev_c.get("CRITICAL",0)))
         with a4: st.metric("Eye Risk",  f"{risk*100:.0f}%")
 
-        # What's being measured (eye.py style legend)
         st.markdown(f"""
         <div class="card" style="padding:.65rem .8rem;margin-top:.3rem;">
           <div class="sec" style="margin-bottom:.3rem;">MEASURING</div>
@@ -1123,7 +1190,7 @@ def page_calibration():
               f'<div style="width:7px;height:7px;border-radius:50%;background:{c};margin-top:4px;flex-shrink:0;"></div>'
               f'<div style="font-size:.75rem;color:{TEXT};">'
               f'<b>{label}</b> — <span style="color:{MUTED};">{desc}</span></div></div>'
-              for label,desc,c in [
+              for label, desc, c in [
                   ("Blink Rate",   "Blinks/min — hypomimia sign if below 3",           SAFE),
                   ("Head Yaw",     "Horizontal head rotation — compensatory movement", WARN),
                   ("Fixation Dur", "Duration of stable gaze hold",                    ACCENT2),
@@ -1133,7 +1200,7 @@ def page_calibration():
         </div>""", unsafe_allow_html=True)
 
     st.markdown("<br>", unsafe_allow_html=True)
-    pc,sc = st.columns([7,1])
+    pc, sc = st.columns([7, 1])
     with pc:
         st.progress(pct, text=f"Eye baseline: {elapsed:.1f}s / {EYE_CAL_SEC}s  |  {rem:.0f}s remaining")
     with sc:
@@ -1148,13 +1215,13 @@ def page_calibration():
         time.sleep(0.28); st.rerun()
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 3: GRID SPATIAL MEMORY TASK
-
+# ══════════════════════════════════════════════════════════════════════════════
 def page_mem_intro():
     hdr(f"Participant: {st.session_state.participant}")
     show_steps(3)
-    col,_ = st.columns([2,1], gap="large")
+    col, _ = st.columns([2, 1], gap="large")
     with col:
         st.markdown(f"""
         <div class="card-blue">
@@ -1162,7 +1229,7 @@ def page_mem_intro():
             <h2 style="color:{TEXT};margin:.25rem 0 .35rem;font-size:1.4rem;font-weight:700;">
                 4x4 Grid Location Recall</h2>
             <p style="color:{MUTED};font-size:.87rem;margin-bottom:.9rem;">
-                Assesses visuospatial recall and working memory - early indicators of LBD posterior
+                Assesses visuospatial recall and working memory — early indicators of LBD posterior
                 cortical impairment. You will complete {MEM_TRIALS} trials.
                 The number of cells to remember increases from 3 to 5 across trials.
                 You have <strong>{int(MEM_SHOW_SEC)}s to study</strong> and
@@ -1170,17 +1237,17 @@ def page_mem_intro():
             </p><hr class="div">""", unsafe_allow_html=True)
         steps_info = [
             ("Study the coloured cells",
-             f"A 4x4 grid appears. Between 3 and 5 cells are highlighted in colour."),
+             "A 4x4 grid appears. Between 3 and 5 cells are highlighted in colour."),
             (f"Pattern hides after {int(MEM_SHOW_SEC)} seconds",
              "All cells turn grey. Memorise positions before they disappear."),
             ("Click each cell you remember",
-             f"A blank 4x4 grid appears. Click the cells you think were highlighted."),
+             "A blank 4x4 grid appears. Click the cells you think were highlighted."),
             ("Click again to deselect",
              "If you click a wrong cell, click it again to deselect. Then press Submit."),
             ("Feedback is shown instantly",
              "Hit, Miss, and False Alarm cells are colour-coded. Reaction time is recorded."),
         ]
-        for i,(t,d) in enumerate(steps_info):
+        for i, (t, d) in enumerate(steps_info):
             st.markdown(f"""
             <div style="display:flex;gap:9px;align-items:flex-start;margin-bottom:.6rem;">
                 <div style="background:{ACCENT};color:#fff;font-weight:700;font-size:.68rem;
@@ -1194,12 +1261,12 @@ def page_mem_intro():
         st.markdown('</div>', unsafe_allow_html=True)
         st.markdown(
             f'<div style="display:flex;gap:10px;margin:.5rem 0 .8rem;flex-wrap:wrap;">'
-            f'<span class="badge b-green">HIT - Correct recall</span>'
-            f'<span class="badge b-red">MISS - Forgotten cell</span>'
-            f'<span class="badge b-amber">FALSE ALARM - Not in pattern</span>'
+            f'<span class="badge b-green">HIT — Correct recall</span>'
+            f'<span class="badge b-red">MISS — Forgotten cell</span>'
+            f'<span class="badge b-amber">FALSE ALARM — Not in pattern</span>'
             f'</div>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
-        c1,c2,c3 = st.columns([2,1,2])
+        c1, c2, c3 = st.columns([2, 1, 2])
         with c2:
             if st.button("Start Memory Task", use_container_width=True):
                 st.session_state.mem_trial  = 0
@@ -1209,8 +1276,8 @@ def page_mem_intro():
 
 
 def _mem_gen():
-    trial = st.session_state.mem_trial
-    n_lit = min(3 + (trial//2), 5)
+    trial  = st.session_state.mem_trial
+    n_lit  = min(3 + (trial // 2), 5)
     pattern = random.sample(range(GRID_CELLS), n_lit)
     st.session_state.mem_pattern     = sorted(pattern)
     st.session_state.mem_probe_count = n_lit
@@ -1219,25 +1286,25 @@ def _mem_gen():
     st.session_state.mem_selections  = []
 
 
-def _draw_grid_show(pattern:list, time_frac:float):
-    cw,ch,gap = 110,72,8
-    total_w   = GRID_COLS*cw + (GRID_COLS+1)*gap
-    total_h   = GRID_ROWS*ch + (GRID_ROWS+1)*gap
+def _draw_grid_show(pattern: list, time_frac: float):
+    cw, ch, gap = 110, 72, 8
+    total_w = GRID_COLS * cw + (GRID_COLS + 1) * gap
+    total_h = GRID_ROWS * ch + (GRID_ROWS + 1) * gap
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{total_h+44}" '
         f'style="display:block;margin:auto;background:{SURFACE};border:1.5px solid {BORDER};'
         f'border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.07);">'
     ]
     for cell_id in range(GRID_CELLS):
-        row = cell_id//GRID_COLS; col = cell_id%GRID_COLS
-        x   = gap + col*(cw+gap);  y = gap + row*(ch+gap)
+        row = cell_id // GRID_COLS; col = cell_id % GRID_COLS
+        x   = gap + col * (cw + gap); y = gap + row * (ch + gap)
         lit = cell_id in pattern
         if lit:
             ci    = pattern.index(cell_id) % len(CELL_COLORS)
             fill  = CELL_COLORS[ci]; stroke = fill; tc = "#fff"; fw_ = "700"
         else:
             fill = LIGHT; stroke = BORDER; tc = BORDER; fw_ = "400"
-        row_lbl = chr(ord("A")+row); col_lbl = str(col+1)
+        row_lbl = chr(ord("A") + row); col_lbl = str(col + 1)
         label   = f"{row_lbl}{col_lbl}"
         svg.append(
             f'<rect x="{x}" y="{y}" width="{cw}" height="{ch}" rx="7" '
@@ -1246,8 +1313,8 @@ def _draw_grid_show(pattern:list, time_frac:float):
             f'font-size="20" font-family="monospace" font-weight="{fw_}" fill="{tc}">'
             f'{label}</text>'
         )
-    by  = total_h+10
-    bw  = int(time_frac*(total_w-20))
+    by  = total_h + 10
+    bw  = int(time_frac * (total_w - 20))
     c_t = ACCENT if time_frac > .40 else (WARN if time_frac > .15 else DANGER)
     svg.append(
         f'<rect x="10" y="{by}" width="{total_w-20}" height="9" rx="4" fill="{LIGHT}"/>'
@@ -1260,33 +1327,26 @@ def _draw_grid_show(pattern:list, time_frac:float):
     st.markdown("".join(svg), unsafe_allow_html=True)
 
 
-def _draw_grid_recall(selected:list, n_needed:int, trial:int):
-    """
-    SVG-based interactive recall grid with color feedback:
-    - Unselected: light grey
-    - Selected: blue highlight  (user clicks → rerun toggles)
-    Uses hidden Streamlit buttons as the click receivers, overlaid on SVG.
-    """
-    cw,ch,gap = 108,68,8
-    total_w   = GRID_COLS*cw + (GRID_COLS+1)*gap
-    total_h   = GRID_ROWS*ch + (GRID_ROWS+1)*gap
+def _draw_grid_recall(selected: list, n_needed: int, trial: int):
+    cw, ch, gap = 108, 68, 8
+    total_w = GRID_COLS * cw + (GRID_COLS + 1) * gap
+    total_h = GRID_ROWS * ch + (GRID_ROWS + 1) * gap
 
-    # Build SVG showing selection state
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{total_h+10}" '
         f'style="display:block;margin:auto;background:{SURFACE};border:1.5px solid {BORDER};'
         f'border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.06);">'
     ]
     for cell_id in range(GRID_CELLS):
-        row_ = cell_id//GRID_COLS; col_ = cell_id%GRID_COLS
-        x    = gap + col_*(cw+gap); y = gap + row_*(ch+gap)
+        row_ = cell_id // GRID_COLS; col_ = cell_id % GRID_COLS
+        x    = gap + col_ * (cw + gap); y = gap + row_ * (ch + gap)
         is_sel = cell_id in selected
-        row_lbl = chr(ord("A")+row_); col_lbl = str(col_+1)
+        row_lbl = chr(ord("A") + row_); col_lbl = str(col_ + 1)
         label   = f"{row_lbl}{col_lbl}"
         if is_sel:
-            fill="#3182CE"; stroke="#2B6CB0"; tc="#FFFFFF"; fw_="700"
+            fill = "#3182CE"; stroke = "#2B6CB0"; tc = "#FFFFFF"; fw_ = "700"
         else:
-            fill=LIGHT; stroke=BORDER; tc=MUTED; fw_="400"
+            fill = LIGHT; stroke = BORDER; tc = MUTED; fw_ = "400"
         svg.append(
             f'<rect x="{x}" y="{y}" width="{cw}" height="{ch}" rx="7" '
             f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
@@ -1297,23 +1357,15 @@ def _draw_grid_recall(selected:list, n_needed:int, trial:int):
     svg.append('</svg>')
     st.markdown("".join(svg), unsafe_allow_html=True)
 
-    # Actual clickable buttons (compact, below SVG visual)
     st.markdown(f'<div style="max-width:528px;margin:6px auto 0;">', unsafe_allow_html=True)
     for row_ in range(GRID_ROWS):
         cols_st = st.columns(GRID_COLS, gap="small")
         for col_ in range(GRID_COLS):
-            cell_id = row_*GRID_COLS + col_
-            row_lbl = chr(ord("A")+row_); col_lbl = str(col_+1)
+            cell_id = row_ * GRID_COLS + col_
+            row_lbl = chr(ord("A") + row_); col_lbl = str(col_ + 1)
             label   = f"{row_lbl}{col_lbl}"
             is_sel  = cell_id in selected
             with cols_st[col_]:
-                # Inject per-button color via markdown just before the button
-                if is_sel:
-                    st.markdown(
-                        f'<style>div[data-testid="stButton"] button[kind="secondary"]'
-                        f':has(p:contains("{label}")) {{background:#3182CE!important;'
-                        f'color:#fff!important;border:2px solid #2B6CB0!important;}}</style>',
-                        unsafe_allow_html=True)
                 btn_lbl = f"✓ {label}" if is_sel else label
                 if st.button(btn_lbl, key=f"cell_{trial}_{cell_id}", use_container_width=True):
                     if is_sel:
@@ -1336,30 +1388,30 @@ def _draw_grid_recall(selected:list, n_needed:int, trial:int):
         f'</div>', unsafe_allow_html=True)
 
 
-def _draw_grid_feedback(pattern:list, selected:list):
-    cw,ch,gap = 110,72,8
-    total_w   = GRID_COLS*cw + (GRID_COLS+1)*gap
-    total_h   = GRID_ROWS*ch + (GRID_ROWS+1)*gap
+def _draw_grid_feedback(pattern: list, selected: list):
+    cw, ch, gap = 110, 72, 8
+    total_w = GRID_COLS * cw + (GRID_COLS + 1) * gap
+    total_h = GRID_ROWS * ch + (GRID_ROWS + 1) * gap
     svg = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}" height="{total_h+50}" '
         f'style="display:block;margin:auto;background:{SURFACE};border:1.5px solid {BORDER};'
         f'border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,.07);">'
     ]
     for cell_id in range(GRID_CELLS):
-        r   = cell_id//GRID_COLS; c = cell_id%GRID_COLS
-        x   = gap+c*(cw+gap);   y = gap+r*(ch+gap)
+        r = cell_id // GRID_COLS; c = cell_id % GRID_COLS
+        x = gap + c * (cw + gap); y = gap + r * (ch + gap)
         in_pat = cell_id in pattern
         in_sel = cell_id in selected
-        row_lbl = chr(ord("A")+r); col_lbl = str(c+1)
+        row_lbl = chr(ord("A") + r); col_lbl = str(c + 1)
         label   = f"{row_lbl}{col_lbl}"
         if in_pat and in_sel:
-            fill="#9AE6B4"; stroke=SAFE;   glyph="HIT";  tc=SAFE
+            fill = "#9AE6B4"; stroke = SAFE;   glyph = "HIT";  tc = SAFE
         elif in_pat and not in_sel:
-            fill="#FEB2B2"; stroke=DANGER; glyph="MISS"; tc=DANGER
+            fill = "#FEB2B2"; stroke = DANGER; glyph = "MISS"; tc = DANGER
         elif not in_pat and in_sel:
-            fill="#F6AD55"; stroke=WARN;   glyph="FA";   tc=WARN
+            fill = "#F6AD55"; stroke = WARN;   glyph = "FA";   tc = WARN
         else:
-            fill=LIGHT;    stroke=BORDER;  glyph=label;  tc=MUTED
+            fill = LIGHT;    stroke = BORDER;  glyph = label;  tc = MUTED
         svg.append(
             f'<rect x="{x}" y="{y}" width="{cw}" height="{ch}" rx="7" '
             f'fill="{fill}" stroke="{stroke}" stroke-width="2"/>'
@@ -1368,9 +1420,9 @@ def _draw_grid_feedback(pattern:list, selected:list):
             f'<text x="{x+cw//2}" y="{y+ch//2+13}" text-anchor="middle" '
             f'font-size="14" font-family="monospace" font-weight="700" fill="{tc}">{glyph}</text>'
         )
-    ly = total_h+13
-    for i,(txt,col_) in enumerate([("HIT","#9AE6B4"),("MISS","#FEB2B2"),("False Alarm","#F6AD55")]):
-        lx = 20+i*158
+    ly = total_h + 13
+    for i, (txt, col_) in enumerate([("HIT","#9AE6B4"),("MISS","#FEB2B2"),("False Alarm","#F6AD55")]):
+        lx = 20 + i * 158
         svg.append(
             f'<rect x="{lx}" y="{ly}" width="13" height="13" rx="3" fill="{col_}"/>'
             f'<text x="{lx+18}" y="{ly+11}" font-size="11" font-family="monospace" fill="{MUTED}">{txt}</text>'
@@ -1382,27 +1434,27 @@ def _draw_grid_feedback(pattern:list, selected:list):
 def _mem_record():
     pattern  = st.session_state.mem_pattern
     selected = st.session_state.mem_selections
-    rt       = time.time()-(st.session_state.mem_phase_start or time.time())
-    hits     = len(set(pattern)&set(selected))
-    misses   = len(set(pattern)-set(selected))
-    fa       = len(set(selected)-set(pattern))
-    hr       = hits/max(len(pattern),1)
+    rt       = time.time() - (st.session_state.mem_phase_start or time.time())
+    hits     = len(set(pattern) & set(selected))
+    misses   = len(set(pattern) - set(selected))
+    fa       = len(set(selected) - set(pattern))
+    hr       = hits / max(len(pattern), 1)
     resp = dict(
         hits=hits, misses=misses, false_alarms=fa,
-        hit_rate=round(hr,4), rt=round(rt,3),
+        hit_rate=round(hr, 4), rt=round(rt, 3),
         selected=list(selected), pattern=list(pattern),
-        trial=st.session_state.mem_trial+1,
-        n_cells=len(pattern), accuracy=round(hr,4),
+        trial=st.session_state.mem_trial + 1,
+        n_cells=len(pattern), accuracy=round(hr, 4),
     )
     st.session_state.mem_last   = resp
     st.session_state.mem_trials.append(resp)
     st.session_state.mem_phase  = "feedback"
     st.session_state.gaze_log.extend(
-        GazeSimulator.simulate([(0.5,0.5)], rt*0.5, 30, 0.01))
+        GazeSimulator.simulate([(0.5, 0.5)], rt * 0.5, 30, 0.01))
 
 
 def _mem_next():
-    idx = st.session_state.mem_trial+1
+    idx = st.session_state.mem_trial + 1
     st.session_state.mem_trial = idx
     if idx >= MEM_TRIALS:
         nav("sacc_intro")
@@ -1417,40 +1469,38 @@ def page_mem_task():
 
     phase   = st.session_state.mem_phase
     pattern = st.session_state.mem_pattern
-    elapsed = time.time()-(st.session_state.mem_phase_start or time.time())
+    elapsed = time.time() - (st.session_state.mem_phase_start or time.time())
 
-    m1,m2,m3,m4 = st.columns(4)
+    m1, m2, m3, m4 = st.columns(4)
     with m1: st.metric("Trial", f"{trial+1}/{MEM_TRIALS}")
     with m2:
-        prev = st.session_state.mem_trials
-        avg_h = sum(t["hit_rate"] for t in prev)/max(len(prev),1)
+        prev  = st.session_state.mem_trials
+        avg_h = sum(t["hit_rate"] for t in prev) / max(len(prev), 1)
         st.metric("Avg Hit Rate", f"{avg_h*100:.0f}%" if prev else "--")
     with m3:
-        avg_rt = sum(t["rt"] for t in prev)/max(len(prev),1)
+        avg_rt = sum(t["rt"] for t in prev) / max(len(prev), 1)
         st.metric("Avg RT", f"{avg_rt:.1f}s" if prev else "--")
     with m4:
         st.metric("Cells in Pattern", str(len(pattern)))
 
-
     if phase == "show":
-        rem = max(0.0, MEM_SHOW_SEC-elapsed)
+        rem = max(0.0, MEM_SHOW_SEC - elapsed)
         st.markdown(
             f'<p style="text-align:center;color:{ACCENT};font-weight:600;'
             f'font-family:\'JetBrains Mono\',monospace;font-size:.84rem;margin:.3rem 0 .65rem;">'
             f'Memorise the highlighted cells  —  {rem:.1f}s remaining</p>',
             unsafe_allow_html=True)
-        _draw_grid_show(pattern, rem/MEM_SHOW_SEC)
+        _draw_grid_show(pattern, rem / MEM_SHOW_SEC)
         if rem <= 0:
-            st.session_state.mem_phase      = "recall"
+            st.session_state.mem_phase       = "recall"
             st.session_state.mem_phase_start = time.time()
             st.rerun()
         else:
-            time.sleep(0.30); st.rerun()   # slightly slower refresh
-
+            time.sleep(0.30); st.rerun()
 
     elif phase == "recall":
-        rem  = max(0.0, MEM_RECALL_SEC-elapsed)
-        sel  = st.session_state.mem_selections
+        rem      = max(0.0, MEM_RECALL_SEC - elapsed)
+        sel      = st.session_state.mem_selections
         n_needed = len(pattern)
         st.markdown(f"""
         <div style="background:#FFFAF0;border:1px solid {WARN}44;border-radius:6px;
@@ -1465,21 +1515,20 @@ def page_mem_task():
         </div>""", unsafe_allow_html=True)
         _draw_grid_recall(sel, n_needed, trial)
         st.markdown("<br>", unsafe_allow_html=True)
-        bc1,bc2,bc3 = st.columns([2,1,2])
+        bc1, bc2, bc3 = st.columns([2, 1, 2])
         with bc2:
             if st.button("Submit Answer", use_container_width=True, key=f"mem_sub_{trial}"):
                 _mem_record(); st.rerun()
         if rem <= 0:
             _mem_record(); st.rerun()
 
-
     elif phase == "feedback":
-        resp   = st.session_state.mem_last
-        hits   = resp["hits"];  misses = resp["misses"]
-        fa     = resp["false_alarms"]; hr = resp["hit_rate"]
-        fc     = SAFE if hr>=.70 else (WARN if hr>=.40 else DANGER)
-        bg_fb  = "#F0FFF4" if hr>=.70 else ("#FFFAF0" if hr>=.40 else "#FFF5F5")
-        verdict= "Good recall" if hr>=.70 else ("Partial recall" if hr>=.40 else "Poor recall")
+        resp    = st.session_state.mem_last
+        hits    = resp["hits"];  misses = resp["misses"]
+        fa      = resp["false_alarms"]; hr = resp["hit_rate"]
+        fc      = SAFE if hr >= .70 else (WARN if hr >= .40 else DANGER)
+        bg_fb   = "#F0FFF4" if hr >= .70 else ("#FFFAF0" if hr >= .40 else "#FFF5F5")
+        verdict = "Good recall" if hr >= .70 else ("Partial recall" if hr >= .40 else "Poor recall")
         _draw_grid_feedback(pattern, resp["selected"])
         st.markdown(
             f'<div style="background:{bg_fb};border:1.5px solid {fc}44;'
@@ -1494,13 +1543,13 @@ def page_mem_task():
         _mem_next(); st.rerun()
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 4: SACCADIC INHIBITION TASK
-
+# ══════════════════════════════════════════════════════════════════════════════
 def page_sacc_intro():
     hdr(f"Participant: {st.session_state.participant}")
     show_steps(4)
-    col,_ = st.columns([2,1], gap="large")
+    col, _ = st.columns([2, 1], gap="large")
     with col:
         st.markdown(f"""
         <div class="card" style="border-color:{ACCENT2}44;background:linear-gradient(135deg,#FAF5FF,#F7FAFC);">
@@ -1512,7 +1561,7 @@ def page_sacc_intro():
                 Antisaccade error rate is a validated LBD biomarker. You will complete
                 {SACC_TRIALS} trials. Speed and accuracy are both measured.
             </p><hr class="div">""", unsafe_allow_html=True)
-        for i,(t,d) in enumerate([
+        for i, (t, d) in enumerate([
             ("Fixation cross appears",
              "A central + cross appears. Keep your eyes locked on it."),
             ("A red stimulus dot appears on one side",
@@ -1541,7 +1590,7 @@ def page_sacc_intro():
             unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
-        c1,c2,c3 = st.columns([2,1,2])
+        c1, c2, c3 = st.columns([2, 1, 2])
         with c2:
             if st.button("Start Saccade Task", use_container_width=True):
                 st.session_state.sacc_trial  = 0
@@ -1551,9 +1600,9 @@ def page_sacc_intro():
 
 
 def _sacc_gen():
-    side = random.choice(["left","right"])
+    side = random.choice(["left", "right"])
     st.session_state.sacc_side        = side
-    st.session_state.sacc_correct     = "right" if side=="left" else "left"
+    st.session_state.sacc_correct     = "right" if side == "left" else "left"
     st.session_state.sacc_phase       = "fixation"
     st.session_state.sacc_phase_start = time.time()
     st.session_state.sacc_last        = {}
@@ -1565,20 +1614,20 @@ def page_sacc_task():
     show_steps(4)
 
     phase   = st.session_state.sacc_phase
-    elapsed = time.time()-(st.session_state.sacc_phase_start or time.time())
-    W_S,H_S = 700,260
+    elapsed = time.time() - (st.session_state.sacc_phase_start or time.time())
+    W_S, H_S = 700, 260
 
     n_done = len(st.session_state.sacc_trials)
     err    = sum(t["error"] for t in st.session_state.sacc_trials)
-    avg_rt = sum(t["rt"]    for t in st.session_state.sacc_trials)/max(n_done,1)
-    er_pct = err/max(n_done,1)*100
+    avg_rt = sum(t["rt"]    for t in st.session_state.sacc_trials) / max(n_done, 1)
+    er_pct = err / max(n_done, 1) * 100
 
-    m1,m2,m3,m4 = st.columns(4)
-    with m1: st.metric("Trial", f"{trial+1}/{SACC_TRIALS}")
-    with m2: st.metric("Errors", f"{err}/{n_done}" if n_done else "--")
-    with m3: st.metric("Avg RT", f"{avg_rt*1000:.0f}ms" if n_done else "--")
+    m1, m2, m3, m4 = st.columns(4)
+    with m1: st.metric("Trial",   f"{trial+1}/{SACC_TRIALS}")
+    with m2: st.metric("Errors",  f"{err}/{n_done}" if n_done else "--")
+    with m3: st.metric("Avg RT",  f"{avg_rt*1000:.0f}ms" if n_done else "--")
     with m4:
-        er_c = DANGER if er_pct>40 else (WARN if er_pct>20 else SAFE)
+        er_c = DANGER if er_pct > 40 else (WARN if er_pct > 20 else SAFE)
         st.markdown(
             f'<div style="text-align:center;">'
             f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:.65rem;color:{MUTED};">ERROR RATE</div>'
@@ -1596,9 +1645,9 @@ def page_sacc_task():
             bd_ = "#9AE6B4" if ok else "#FEB2B2"
             sym = "+" if ok else "x"
         elif i == trial:
-            bg_="#EBF8FF"; fg_=ACCENT; bd_="#90CDF4"; sym=str(i+1)
+            bg_ = "#EBF8FF"; fg_ = ACCENT; bd_ = "#90CDF4"; sym = str(i+1)
         else:
-            bg_=LIGHT; fg_=BORDER; bd_=BORDER; sym=str(i+1)
+            bg_ = LIGHT; fg_ = BORDER; bd_ = BORDER; sym = str(i+1)
         cells += (
             f'<div style="background:{bg_};border:1.5px solid {bd_};border-radius:5px;'
             f'padding:5px 0;text-align:center;font-family:\'JetBrains Mono\',monospace;'
@@ -1609,12 +1658,12 @@ def page_sacc_task():
         f'{cells}</div>', unsafe_allow_html=True)
 
     def sacc_canvas(show_dot=False):
-        cx_,cy_ = W_S//2, H_S//2
+        cx_, cy_ = W_S // 2, H_S // 2
         p = [
             f'<svg xmlns="http://www.w3.org/2000/svg" width="{W_S}" height="{H_S}" '
             f'style="background:#F7FAFC;border:1.5px solid {BORDER};border-radius:8px;'
             f'display:block;margin:auto;box-shadow:0 1px 4px rgba(0,0,0,.05);">',
-            grid_svg_bg(W_S,H_S),
+            grid_svg_bg(W_S, H_S),
         ]
         p.append(
             f'<line x1="{cx_}" y1="18" x2="{cx_}" y2="{H_S-18}" '
@@ -1625,7 +1674,7 @@ def page_sacc_task():
             f'font-size="16" fill="{BORDER}" font-weight="600">RIGHT</text>'
         )
         if not show_dot:
-            rem = max(0, SACC_FIX_SEC-elapsed)
+            rem = max(0, SACC_FIX_SEC - elapsed)
             p.append(
                 f'<line x1="{cx_-22}" y1="{cy_}" x2="{cx_+22}" y2="{cy_}" stroke="{TEXT}" stroke-width="3"/>'
                 f'<line x1="{cx_}" y1="{cy_-22}" x2="{cx_}" y2="{cy_+22}" stroke="{TEXT}" stroke-width="3"/>'
@@ -1636,10 +1685,10 @@ def page_sacc_task():
         else:
             side  = st.session_state.sacc_side
             corr  = st.session_state.sacc_correct
-            dot_x = W_S//4  if side=="left"  else 3*W_S//4
-            cx2   = 3*W_S//4 if side=="left" else W_S//4
-            rem   = max(0, SACC_STIM_SEC-elapsed)
-            arrow = ">" if side=="left" else "<"
+            dot_x = W_S // 4 if side == "left" else 3 * W_S // 4
+            cx2   = 3 * W_S // 4 if side == "left" else W_S // 4
+            rem   = max(0, SACC_STIM_SEC - elapsed)
+            arrow = ">" if side == "left" else "<"
             p.append(
                 f'<circle cx="{dot_x}" cy="{cy_}" r="22" fill="{DANGER}22"/>'
                 f'<circle cx="{dot_x}" cy="{cy_}" r="15" fill="{DANGER}"/>'
@@ -1658,16 +1707,16 @@ def page_sacc_task():
         return "".join(p)
 
     if phase == "fixation":
-        rem = max(0, SACC_FIX_SEC-elapsed)
+        rem = max(0, SACC_FIX_SEC - elapsed)
         st.markdown(
             f'<p style="text-align:center;color:{MUTED};font-family:\'JetBrains Mono\',monospace;'
             f'font-size:.84rem;margin-bottom:.45rem;">'
             f'Focus on the central cross  -  stimulus in {rem:.1f}s</p>',
             unsafe_allow_html=True)
         st.markdown(sacc_canvas(False), unsafe_allow_html=True)
-        st.session_state.gaze_log.extend(GazeSimulator.simulate([(0.5,0.5)], 0.2, 30, 0.005))
+        st.session_state.gaze_log.extend(GazeSimulator.simulate([(0.5, 0.5)], 0.2, 30, 0.005))
         if rem <= 0:
-            st.session_state.sacc_phase      = "stimulus"
+            st.session_state.sacc_phase       = "stimulus"
             st.session_state.sacc_phase_start = time.time()
             st.rerun()
         else:
@@ -1676,7 +1725,7 @@ def page_sacc_task():
     elif phase == "stimulus":
         side = st.session_state.sacc_side
         corr = st.session_state.sacc_correct
-        rem  = max(0, SACC_STIM_SEC-elapsed)
+        rem  = max(0, SACC_STIM_SEC - elapsed)
         st.markdown(
             f'<div style="text-align:center;margin-bottom:.45rem;">'
             f'<span style="background:{DANGER}12;border:1.5px solid {DANGER}38;'
@@ -1686,20 +1735,20 @@ def page_sacc_task():
             unsafe_allow_html=True)
         st.markdown(sacc_canvas(True), unsafe_allow_html=True)
         st.markdown("<br>", unsafe_allow_html=True)
-        bl,br_ = st.columns(2, gap="large")
+        bl, br_ = st.columns(2, gap="large")
         with bl:
-            if st.button(f"LEFT", key=f"sl_{trial}", use_container_width=True):
+            if st.button("LEFT", key=f"sl_{trial}", use_container_width=True):
                 _sacc_record("left"); st.rerun()
             st.markdown(
                 f'<div style="text-align:center;font-family:\'JetBrains Mono\',monospace;'
-                f'font-size:.72rem;color:{""+SAFE+"" if corr=="left" else DANGER};">'
+                f'font-size:.72rem;color:{SAFE if corr=="left" else DANGER};">'
                 f'{"CORRECT" if corr=="left" else "ERROR"}</div>', unsafe_allow_html=True)
         with br_:
-            if st.button(f"RIGHT", key=f"sr_{trial}", use_container_width=True):
+            if st.button("RIGHT", key=f"sr_{trial}", use_container_width=True):
                 _sacc_record("right"); st.rerun()
             st.markdown(
                 f'<div style="text-align:center;font-family:\'JetBrains Mono\',monospace;'
-                f'font-size:.72rem;color:{""+SAFE+"" if corr=="right" else DANGER};">'
+                f'font-size:.72rem;color:{SAFE if corr=="right" else DANGER};">'
                 f'{"CORRECT" if corr=="right" else "ERROR"}</div>', unsafe_allow_html=True)
         if rem <= 0:
             _sacc_record("timeout"); st.rerun()
@@ -1708,17 +1757,17 @@ def page_sacc_task():
 
     elif phase == "feedback":
         resp  = st.session_state.sacc_last
-        error = resp.get("error",1)
-        rt    = resp.get("rt",0)
-        rs    = resp.get("response","timeout")
+        error = resp.get("error", 1)
+        rt    = resp.get("rt", 0)
+        rs    = resp.get("response", "timeout")
         fc    = SAFE if not error else DANGER
         bg_fb = "#F0FFF4" if not error else "#FFF5F5"
         if rs == "timeout":
-            lbl = "Timeout - no response recorded"
+            lbl = "Timeout — no response recorded"
         elif not error:
-            lbl = f"Correct - looked {st.session_state.sacc_correct.upper()}"
+            lbl = f"Correct — looked {st.session_state.sacc_correct.upper()}"
         else:
-            lbl = "Error - reflexive saccade toward the stimulus"
+            lbl = "Error — reflexive saccade toward the stimulus"
 
         st.markdown(sacc_canvas(False), unsafe_allow_html=True)
         st.markdown(
@@ -1731,39 +1780,36 @@ def page_sacc_task():
             f'  |  Correct: {st.session_state.sacc_correct.upper()}'
             f'  |  Response: {rs.upper()}</div></div>',
             unsafe_allow_html=True)
-        cx_g = 0.15 if rs=="left" else (0.85 if rs=="right" else 0.5)
-        st.session_state.gaze_log.extend(GazeSimulator.simulate([(cx_g,0.5)], 0.6, 30, 0.01))
+        cx_g = 0.15 if rs == "left" else (0.85 if rs == "right" else 0.5)
+        st.session_state.gaze_log.extend(GazeSimulator.simulate([(cx_g, 0.5)], 0.6, 30, 0.01))
         det: AnomalyDetector = st.session_state.det
         det.process_saccade(
-            latency_ms=rt*1000, peak_vel=float(random.gauss(265,55)),
-            amplitude=float(random.gauss(8,2)),
+            latency_ms=rt * 1000, peak_vel=float(random.gauss(265, 55)),
+            amplitude=float(random.gauss(8, 2)),
             cx=cx_g, cy=0.5, is_anti=True, correct=(not error),
         )
         time.sleep(1.0)
         _sacc_next(); st.rerun()
 
 
-def _sacc_record(direction:str):
-    rt    = time.time()-(st.session_state.sacc_phase_start or time.time())
-    if direction not in ("left","right"):
-        error = 1
-    else:
-        error = int(direction != st.session_state.sacc_correct)
-    resp = {"response":direction, "rt":round(rt,4), "error":error}
+def _sacc_record(direction: str):
+    rt    = time.time() - (st.session_state.sacc_phase_start or time.time())
+    error = int(direction != st.session_state.sacc_correct) if direction in ("left", "right") else 1
+    resp  = {"response": direction, "rt": round(rt, 4), "error": error}
     st.session_state.sacc_last = resp
     st.session_state.sacc_trials.append({
-        "trial":        st.session_state.sacc_trial+1,
+        "trial":        st.session_state.sacc_trial + 1,
         "stim_side":    st.session_state.sacc_side,
         "correct_side": st.session_state.sacc_correct,
         "response":     direction,
         "error":        error,
-        "rt":           round(rt,4),
+        "rt":           round(rt, 4),
     })
     st.session_state.sacc_phase = "feedback"
 
 
 def _sacc_next():
-    idx = st.session_state.sacc_trial+1
+    idx = st.session_state.sacc_trial + 1
     st.session_state.sacc_trial = idx
     if idx >= SACC_TRIALS:
         nav("report")
@@ -1771,9 +1817,9 @@ def _sacc_next():
         _sacc_gen()
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 # PAGE 5: RISK REPORT
-
+# ══════════════════════════════════════════════════════════════════════════════
 def page_report():
     hdr(f"Report  |  {st.session_state.participant}  |  "
         f"{datetime.now().strftime('%Y-%m-%d %H:%M')}")
@@ -1784,11 +1830,11 @@ def page_report():
     gaze_log    = st.session_state.gaze_log
     det: AnomalyDetector = st.session_state.det
 
-    mem_hr   = sum(t["hit_rate"]      for t in mem_trials)  / max(len(mem_trials),1)
-    mem_rt   = sum(t["rt"]            for t in mem_trials)  / max(len(mem_trials),1)
-    mem_fa   = sum(t["false_alarms"]  for t in mem_trials)  / max(len(mem_trials),1)
-    s_err    = sum(t["error"]         for t in sacc_trials) / max(len(sacc_trials),1)
-    s_rt     = sum(t["rt"]            for t in sacc_trials) / max(len(sacc_trials),1)
+    mem_hr  = sum(t["hit_rate"]     for t in mem_trials)  / max(len(mem_trials),  1)
+    mem_rt  = sum(t["rt"]           for t in mem_trials)  / max(len(mem_trials),  1)
+    mem_fa  = sum(t["false_alarms"] for t in mem_trials)  / max(len(mem_trials),  1)
+    s_err   = sum(t["error"]        for t in sacc_trials) / max(len(sacc_trials), 1)
+    s_rt    = sum(t["rt"]           for t in sacc_trials) / max(len(sacc_trials), 1)
 
     ext   = FeatureExtractor()
     feats = {
@@ -1799,45 +1845,35 @@ def page_report():
         "antisaccade_rt":         s_rt,
     }
 
-    clf      = load_classifier()
-    res      = clf.predict(feats)
+    clf = load_classifier()
+    res = clf.predict(feats)
 
     mem_risk  = float(np.clip(
         (1.0 - mem_hr) * 0.50 +
         float(np.clip((mem_rt - 5.0) / 15.0, 0, 1)) * 0.25 +
         float(np.clip(mem_fa / 3.0, 0, 1)) * 0.25,
         0, 1))
-
     sacc_risk = float(np.clip(s_err, 0, 1))
-
     anom_r    = det.get_risk_score()
-
     combined  = float(np.clip(
-        mem_risk * 0.35 +
-        sacc_risk * 0.35 +
-        anom_r   * 0.30,
+        mem_risk * 0.35 + sacc_risk * 0.35 + anom_r * 0.30,
         0, 1))
-    pct       = round(combined * 100)
-    if combined >= 0.66:
-        risk_level = "HIGH"
-        rc = DANGER
-        v_cls = "v-high"
-    elif combined >= 0.33:
-        risk_level = "MODERATE"
-        rc = WARN
-        v_cls = "v-mod"
-    else:
-        risk_level = "LOW"
-        rc = SAFE
-        v_cls = "v-low"
+    pct = round(combined * 100)
 
-    n_anom   = len(det.events)
-    lbd_n    = sum(1 for e in det.events if e.is_lbd_biomarker)
-    sev_cnt  = Counter(e.severity   for e in det.events)
-    typ_cnt  = Counter(e.anomaly_type for e in det.events)
+    if combined >= 0.66:
+        risk_level = "HIGH";     rc = DANGER; v_cls = "v-high"
+    elif combined >= 0.33:
+        risk_level = "MODERATE"; rc = WARN;   v_cls = "v-mod"
+    else:
+        risk_level = "LOW";      rc = SAFE;   v_cls = "v-low"
+
+    n_anom  = len(det.events)
+    lbd_n   = sum(1 for e in det.events if e.is_lbd_biomarker)
+    sev_cnt = Counter(e.severity    for e in det.events)
+    typ_cnt = Counter(e.anomaly_type for e in det.events)
 
     st.markdown('<div class="sec">CLINICAL RISK ASSESSMENT</div>', unsafe_allow_html=True)
-    va,vb = st.columns([5,2], gap="large")
+    va, vb = st.columns([5, 2], gap="large")
 
     with va:
         risk_descriptions = {
@@ -1872,31 +1908,31 @@ def page_report():
             <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:7px;margin-top:10px;">
                 <div style="background:{SURFACE};border-radius:5px;padding:.45rem;text-align:center;border:1px solid {BORDER};">
                     <div style="font-family:'JetBrains Mono',monospace;font-size:.60rem;color:{MUTED};">MEMORY</div>
-                    <div style="font-size:1.05rem;font-weight:700;color:{''+DANGER if mem_score_pct>=66 else (''+WARN if mem_score_pct>=33 else SAFE)};">{mem_score_pct}%</div>
+                    <div style="font-size:1.05rem;font-weight:700;color:{DANGER if mem_score_pct>=66 else (WARN if mem_score_pct>=33 else SAFE)};">{mem_score_pct}%</div>
                 </div>
                 <div style="background:{SURFACE};border-radius:5px;padding:.45rem;text-align:center;border:1px solid {BORDER};">
                     <div style="font-family:'JetBrains Mono',monospace;font-size:.60rem;color:{MUTED};">SACCADE</div>
-                    <div style="font-size:1.05rem;font-weight:700;color:{''+DANGER if sacc_score_pct>=66 else (''+WARN if sacc_score_pct>=33 else SAFE)};">{sacc_score_pct}%</div>
+                    <div style="font-size:1.05rem;font-weight:700;color:{DANGER if sacc_score_pct>=66 else (WARN if sacc_score_pct>=33 else SAFE)};">{sacc_score_pct}%</div>
                 </div>
                 <div style="background:{SURFACE};border-radius:5px;padding:.45rem;text-align:center;border:1px solid {BORDER};">
                     <div style="font-family:'JetBrains Mono',monospace;font-size:.60rem;color:{MUTED};">EYE ANOMALY</div>
-                    <div style="font-size:1.05rem;font-weight:700;color:{''+DANGER if anom_score_pct>=66 else (''+WARN if anom_score_pct>=33 else SAFE)};">{anom_score_pct}%</div>
+                    <div style="font-size:1.05rem;font-weight:700;color:{DANGER if anom_score_pct>=66 else (WARN if anom_score_pct>=33 else SAFE)};">{anom_score_pct}%</div>
                 </div>
             </div>
         </div>""", unsafe_allow_html=True)
 
     with vb:
-        fig,ax = plt.subplots(figsize=(2.3,2.3), facecolor=SURFACE)
+        fig, ax = plt.subplots(figsize=(2.3, 2.3), facecolor=SURFACE)
         th = np.linspace(0, 2*math.pi, 300)
         ax.plot(np.cos(th)*0.72, np.sin(th)*0.72, lw=11, color=LIGHT, solid_capstyle="round")
-        ft = np.linspace(math.pi/2, math.pi/2-2*math.pi*pct/100, 300)
-        if len(ft)>1:
+        ft = np.linspace(math.pi/2, math.pi/2 - 2*math.pi*pct/100, 300)
+        if len(ft) > 1:
             ax.plot(np.cos(ft)*0.72, np.sin(ft)*0.72, lw=11, color=rc, solid_capstyle="round")
-        ax.text(0,.10,f"{pct}%", ha="center",va="center",
-                fontsize=20,fontweight="bold",color=rc,fontfamily="monospace")
-        ax.text(0,-.22,"LBD RISK", ha="center",va="center",
-                fontsize=7,color=MUTED,fontfamily="monospace")
-        ax.set_xlim(-1,1); ax.set_ylim(-1,1)
+        ax.text(0,  .10, f"{pct}%", ha="center", va="center",
+                fontsize=20, fontweight="bold", color=rc, fontfamily="monospace")
+        ax.text(0, -.22, "LBD RISK", ha="center", va="center",
+                fontsize=7, color=MUTED, fontfamily="monospace")
+        ax.set_xlim(-1, 1); ax.set_ylim(-1, 1)
         ax.set_aspect("equal"); ax.axis("off")
         fig.tight_layout(pad=0.1)
         st.pyplot(fig, use_container_width=True)
@@ -1905,23 +1941,24 @@ def page_report():
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="sec">THREE-LEVEL RISK CLASSIFICATION</div>', unsafe_allow_html=True)
     three_levels = [
-        ("LEVEL 1", "LOW",      SAFE,   "#F0FFF4", "0–33%",
+        ("LEVEL 1","LOW",      SAFE,   "#F0FFF4","0–33%",
          "Performance within normal range. No significant LBD indicators. Routine monitoring recommended."),
-        ("LEVEL 2", "MODERATE", WARN,   "#FFFAF0", "33–66%",
+        ("LEVEL 2","MODERATE", WARN,   "#FFFAF0","33–66%",
          "Some LBD-associated patterns observed. Neurological follow-up is advised."),
-        ("LEVEL 3", "HIGH",     DANGER, "#FFF5F5", "66–100%",
+        ("LEVEL 3","HIGH",     DANGER, "#FFF5F5","66–100%",
          "Multiple LBD biomarkers detected across tasks. Neurological evaluation strongly recommended."),
     ]
     level_html = ""
     for lv_lbl, lv_name, lv_c, lv_bg, lv_range, lv_desc in three_levels:
         is_current = lv_name == risk_level
-        bw         = "3px" if is_current else "1.5px"
-        op         = "1" if is_current else "0.38"
-        bg_val     = lv_bg if is_current else SURFACE
-        bd_col     = lv_c if is_current else lv_c + "88"
-        cur_badge  = (f"<div style='margin-top:8px;font-weight:700;font-size:.75rem;"
-                      f"color:{lv_c};font-family:JetBrains Mono,monospace;'>"
-                      f"&#9658; CURRENT RESULT</div>") if is_current else ""
+        bw = "3px" if is_current else "1.5px"
+        op = "1"   if is_current else "0.38"
+        bg_val = lv_bg   if is_current else SURFACE
+        bd_col = lv_c    if is_current else lv_c + "88"
+        cur_badge = (
+            f"<div style='margin-top:8px;font-weight:700;font-size:.75rem;"
+            f"color:{lv_c};font-family:JetBrains Mono,monospace;'>&#9658; CURRENT RESULT</div>"
+        ) if is_current else ""
         level_html += (
             f'<div style="background:{bg_val};border:{bw} solid {bd_col};'
             f'border-radius:8px;padding:1rem;text-align:center;opacity:{op};">'
@@ -1936,25 +1973,24 @@ def page_report():
         + level_html + '</div>', unsafe_allow_html=True)
 
     st.markdown('<hr class="div">', unsafe_allow_html=True)
-
     col_eye, col_mem, col_sac = st.columns(3, gap="large")
 
     with col_eye:
         st.markdown(f'<div class="sec">EYE ANOMALY ANALYSIS</div>', unsafe_allow_html=True)
-        m1,m2 = st.columns(2)
+        m1, m2 = st.columns(2)
         with m1: st.metric("Total",    str(n_anom))
         with m2: st.metric("LBD",      str(lbd_n))
-        m3,m4 = st.columns(2)
-        with m3: st.metric("Critical", str(sev_cnt.get("CRITICAL",0)))
-        with m4: st.metric("High",     str(sev_cnt.get("HIGH",0)))
+        m3, m4 = st.columns(2)
+        with m3: st.metric("Critical", str(sev_cnt.get("CRITICAL", 0)))
+        with m4: st.metric("High",     str(sev_cnt.get("HIGH", 0)))
 
-        sev_labels  = ["Critical","High","Medium","Low"]
-        sev_vals    = [sev_cnt.get(s,0) for s in ["CRITICAL","HIGH","MEDIUM","LOW"]]
-        sev_colors  = [DANGER,WARN,ACCENT,SAFE]
+        sev_labels = ["Critical","High","Medium","Low"]
+        sev_vals   = [sev_cnt.get(s, 0) for s in ["CRITICAL","HIGH","MEDIUM","LOW"]]
+        sev_colors = [DANGER, WARN, ACCENT, SAFE]
         if sum(sev_vals) > 0:
-            fig2,ax2 = plt.subplots(figsize=(2.8,2.2), facecolor=SURFACE)
+            fig2, ax2 = plt.subplots(figsize=(2.8, 2.2), facecolor=SURFACE)
             ax2.set_facecolor(SURFACE)
-            wedges,_,_ = ax2.pie(
+            ax2.pie(
                 sev_vals, labels=sev_labels, colors=sev_colors,
                 autopct="%1.0f%%", startangle=90,
                 pctdistance=0.78, labeldistance=1.15,
@@ -1962,10 +1998,10 @@ def page_report():
                 wedgeprops={"linewidth":0.4,"edgecolor":"white"},
                 radius=0.9,
             )
-            centre_circle = plt.Circle((0,0),0.55,fc=SURFACE)
+            centre_circle = plt.Circle((0, 0), 0.55, fc=SURFACE)
             ax2.add_artist(centre_circle)
-            ax2.text(0,0,f"{n_anom}\nevents",ha="center",va="center",
-                     fontsize=7,color=TEXT,fontfamily="monospace",fontweight="bold")
+            ax2.text(0, 0, f"{n_anom}\nevents", ha="center", va="center",
+                     fontsize=7, color=TEXT, fontfamily="monospace", fontweight="bold")
             ax2.set_title("Severity breakdown", color=MUTED, fontsize=7, fontfamily="monospace", pad=3)
             fig2.tight_layout(pad=0.2)
             st.pyplot(fig2, use_container_width=True)
@@ -1974,10 +2010,10 @@ def page_report():
         if det.events:
             st.markdown('<div class="sec" style="margin-top:.5rem;">TOP ANOMALIES</div>', unsafe_allow_html=True)
             rows_html = ""
-            for atype,cnt in typ_cnt.most_common(6):
-                sev  = next((e.severity for e in det.events if e.anomaly_type==atype),"LOW")
-                is_l = next((e.is_lbd_biomarker for e in det.events if e.anomaly_type==atype),False)
-                sc2  = "b-red" if sev in ("CRITICAL","HIGH") else ("b-amber" if sev=="MEDIUM" else "b-grey")
+            for atype, cnt in typ_cnt.most_common(6):
+                sev  = next((e.severity for e in det.events if e.anomaly_type == atype), "LOW")
+                is_l = next((e.is_lbd_biomarker for e in det.events if e.anomaly_type == atype), False)
+                sc2  = "b-red" if sev in ("CRITICAL","HIGH") else ("b-amber" if sev == "MEDIUM" else "b-grey")
                 lb2  = '<span class="badge b-red" style="margin-left:3px;font-size:.60rem;">LBD</span>' if is_l else ""
                 rows_html += (
                     f'<div style="display:flex;align-items:center;gap:6px;'
@@ -1995,17 +2031,17 @@ def page_report():
 
     with col_mem:
         st.markdown(f'<div class="sec">MEMORY TASK ANALYSIS</div>', unsafe_allow_html=True)
-        m1,m2 = st.columns(2)
+        m1, m2 = st.columns(2)
         with m1: st.metric("Hit Rate", f"{mem_hr*100:.0f}%")
         with m2: st.metric("Mean RT",  f"{mem_rt:.1f}s")
-        m3,m4 = st.columns(2)
+        m3, m4 = st.columns(2)
         with m3: st.metric("False Alarms", f"{mem_fa:.1f}/trial")
         with m4:
             total_misses = sum(t["misses"] for t in mem_trials)
             st.metric("Total Misses", str(total_misses))
 
         if mem_trials:
-            fig3,ax3 = plt.subplots(figsize=(2.8,2.2), facecolor=SURFACE)
+            fig3, ax3 = plt.subplots(figsize=(2.8, 2.2), facecolor=SURFACE)
             ax3.set_facecolor("#F7FAFC")
             xs3  = [t["trial"]    for t in mem_trials]
             hrs3 = [t["hit_rate"] for t in mem_trials]
@@ -2014,7 +2050,7 @@ def page_report():
             ax3.bar(xs3, hrs3, color=ACCENT, alpha=0.65, width=0.55, label="Hit rate")
             ax3_r.plot(xs3, rts3, color=DANGER, lw=1.5, marker="o", markersize=4, label="RT (s)")
             ax3.axhline(0.7, color=SAFE, lw=0.9, ls="--", alpha=0.7)
-            ax3.set_ylim(0,1.1); ax3.set_xlabel("Trial", color=MUTED, fontsize=6)
+            ax3.set_ylim(0, 1.1); ax3.set_xlabel("Trial", color=MUTED, fontsize=6)
             ax3.set_ylabel("Hit rate", color=ACCENT, fontsize=6)
             ax3_r.set_ylabel("RT (s)", color=DANGER, fontsize=6)
             ax3.tick_params(colors=MUTED, labelsize=5.5)
@@ -2028,7 +2064,7 @@ def page_report():
 
             rows3 = ""
             for t in mem_trials:
-                hr_c = SAFE if t["hit_rate"]>=.70 else (WARN if t["hit_rate"]>=.40 else DANGER)
+                hr_c = SAFE if t["hit_rate"] >= .70 else (WARN if t["hit_rate"] >= .40 else DANGER)
                 rows3 += (
                     f'<div style="display:grid;grid-template-columns:30px 1fr 1fr 1fr 1fr;'
                     f'gap:4px;padding:3px 0;border-bottom:1px solid {BORDER};font-size:.72rem;'
@@ -2052,24 +2088,23 @@ def page_report():
         st.markdown(f'<div class="sec">SACCADE TASK ANALYSIS</div>', unsafe_allow_html=True)
         n_corr = sum(1 for t in sacc_trials if not t["error"])
         n_err  = sum(t["error"] for t in sacc_trials)
-        n_to   = sum(1 for t in sacc_trials if t["response"]=="timeout")
-        er_c2  = DANGER if s_err>.40 else (WARN if s_err>.20 else SAFE)
-        m1,m2 = st.columns(2)
+        n_to   = sum(1 for t in sacc_trials if t["response"] == "timeout")
+        m1, m2 = st.columns(2)
         with m1: st.metric("Error Rate", f"{s_err*100:.0f}%")
         with m2: st.metric("Mean RT",    f"{s_rt*1000:.0f}ms")
-        m3,m4 = st.columns(2)
-        with m3: st.metric("Correct",  str(n_corr))
-        with m4: st.metric("Errors",   str(n_err))
+        m3, m4 = st.columns(2)
+        with m3: st.metric("Correct", str(n_corr))
+        with m4: st.metric("Errors",  str(n_err))
 
         if sacc_trials:
-            fig4,ax4 = plt.subplots(figsize=(2.8,2.2), facecolor=SURFACE)
+            fig4, ax4 = plt.subplots(figsize=(2.8, 2.2), facecolor=SURFACE)
             ax4.set_facecolor("#F7FAFC")
             xs4  = [t["trial"] for t in sacc_trials]
-            rts4 = [t["rt"]*1000 for t in sacc_trials]
-            cols4= [DANGER if t["error"] else SAFE for t in sacc_trials]
+            rts4 = [t["rt"] * 1000 for t in sacc_trials]
+            cols4 = [DANGER if t["error"] else SAFE for t in sacc_trials]
             ax4.bar(xs4, rts4, color=cols4, alpha=0.75, width=0.6)
-            ax4.axhline(120, color=WARN, lw=1.0, ls="--", alpha=0.8, label="Express threshold")
-            ax4.axhline(800, color=DANGER, lw=0.8, ls=":", alpha=0.6, label="Slow threshold")
+            ax4.axhline(120,  color=WARN,   lw=1.0, ls="--", alpha=0.8, label="Express threshold")
+            ax4.axhline(800,  color=DANGER, lw=0.8, ls=":",  alpha=0.6, label="Slow threshold")
             ax4.set_xlabel("Trial", color=MUTED, fontsize=6)
             ax4.set_ylabel("RT (ms)", color=MUTED, fontsize=6)
             ax4.tick_params(colors=MUTED, labelsize=5.5)
@@ -2110,18 +2145,18 @@ def page_report():
 
     st.markdown('<hr class="div">', unsafe_allow_html=True)
     st.markdown('<div class="sec">GAZE DENSITY HEATMAP  +  FEATURE PROFILE</div>', unsafe_allow_html=True)
-    hcol, rcol = st.columns([3,2], gap="large")
+    hcol, rcol = st.columns([3, 2], gap="large")
 
     with hcol:
         if len(gaze_log) > 10:
-            fig5,ax5 = plt.subplots(figsize=(5,3.2), facecolor=SURFACE)
+            fig5, ax5 = plt.subplots(figsize=(5, 3.2), facecolor=SURFACE)
             ax5.set_facecolor("#EBF8FF")
             xs5 = [p[0] for p in gaze_log]
             ys5 = [p[1] for p in gaze_log]
             try:
-                hmap,_,_ = np.histogram2d(xs5,ys5,bins=30,range=[[0,1],[0,1]])
-                ax5.imshow(gaussian_filter(hmap,1.5).T, origin="upper",
-                           extent=[0,1,1,0], cmap="plasma", alpha=0.80, aspect="auto")
+                hmap, _, _ = np.histogram2d(xs5, ys5, bins=30, range=[[0,1],[0,1]])
+                ax5.imshow(gaussian_filter(hmap, 1.5).T, origin="upper",
+                           extent=[0, 1, 1, 0], cmap="plasma", alpha=0.80, aspect="auto")
             except Exception:
                 pass
             ax5.set_xlabel("Gaze X (norm)", color=MUTED, fontsize=7)
@@ -2146,27 +2181,27 @@ def page_report():
             "antisaccade_rt":        "Antisaccade RT (s)",
         }
         ref_vals = {
-            "fixation_duration":0.24, "saccade_frequency":3.0,
-            "scan_path_length":0.35,  "gaze_variability":0.08,
-            "reaction_time":1.1,      "accuracy":0.84,
-            "antisaccade_error_rate":0.10, "antisaccade_rt":0.36,
+            "fixation_duration":0.24,     "saccade_frequency":3.0,
+            "scan_path_length":0.35,      "gaze_variability":0.08,
+            "reaction_time":1.1,          "accuracy":0.84,
+            "antisaccade_error_rate":0.10,"antisaccade_rt":0.36,
         }
         names_  = list(feat_labels.values())
         vals_   = []
         ref_n_  = []
         for k in FEATURE_COLS:
-            v   = feats.get(k,0)
-            r   = ref_vals.get(k,1)
-            ceil= max(v,r)*1.5 if max(v,r)>0 else 1
-            vals_.append(float(np.clip(v/ceil,0,1)))
-            ref_n_.append(float(np.clip(r/ceil,0,1)))
+            v    = feats.get(k, 0)
+            r    = ref_vals.get(k, 1)
+            ceil = max(v, r) * 1.5 if max(v, r) > 0 else 1
+            vals_.append(float(np.clip(v / ceil, 0, 1)))
+            ref_n_.append(float(np.clip(r / ceil, 0, 1)))
 
-        fig6,ax6 = plt.subplots(figsize=(3.5,3.4), facecolor=SURFACE)
+        fig6, ax6 = plt.subplots(figsize=(3.5, 3.4), facecolor=SURFACE)
         ax6.set_facecolor("#F7FAFC")
-        y6   = np.arange(len(names_))
-        h6   = 0.36
-        ax6.barh(y6+h6/2, vals_,  h6, color=rc,    alpha=0.75, label="Participant")
-        ax6.barh(y6-h6/2, ref_n_, h6, color=BORDER, alpha=0.80, label="Normal range")
+        y6  = np.arange(len(names_))
+        h6  = 0.36
+        ax6.barh(y6 + h6/2, vals_,  h6, color=rc,    alpha=0.75, label="Participant")
+        ax6.barh(y6 - h6/2, ref_n_, h6, color=BORDER, alpha=0.80, label="Normal range")
         ax6.set_yticks(y6)
         ax6.set_yticklabels(names_, fontsize=6, color=MUTED, fontfamily="monospace")
         ax6.set_xlabel("Normalised value", color=MUTED, fontsize=6)
@@ -2180,7 +2215,6 @@ def page_report():
         st.pyplot(fig6, use_container_width=True)
         plt.close(fig6)
 
-
     st.markdown('<hr class="div">', unsafe_allow_html=True)
     st.markdown('<div class="sec">CLINICAL NOTES</div>', unsafe_allow_html=True)
     high_ev = [e for e in det.events if e.severity in ("HIGH","CRITICAL") and e.clinical_note]
@@ -2192,10 +2226,10 @@ def page_report():
             if ev.anomaly_type in seen:
                 continue
             seen.add(ev.anomaly_type)
-            sc3  = DANGER if ev.severity == "CRITICAL" else WARN
-            bg3  = "#FFF5F5" if ev.severity == "CRITICAL" else "#FFFAF0"
-            bd_cls = "b-red" if ev.severity == "CRITICAL" else "b-amber"
-            lbd3 = '<span class="badge b-red" style="margin-left:4px;font-size:.60rem;">LBD</span>' if ev.is_lbd_biomarker else ""
+            sc3    = DANGER if ev.severity == "CRITICAL" else WARN
+            bg3    = "#FFF5F5" if ev.severity == "CRITICAL" else "#FFFAF0"
+            bd_cls = "b-red"  if ev.severity == "CRITICAL" else "b-amber"
+            lbd3   = '<span class="badge b-red" style="margin-left:4px;font-size:.60rem;">LBD</span>' if ev.is_lbd_biomarker else ""
             with note_cols[col_idx % 2]:
                 st.markdown(
                     f'<div style="background:{bg3};border:1px solid {sc3}33;'
@@ -2228,7 +2262,7 @@ def page_report():
             "sacc_risk":   round(sacc_risk, 4),
             "anomaly_risk":round(anom_r, 4),
         },
-        "features": {k: round(v, 4) for k, v in feats.items()},
+        "features":    {k: round(v, 4) for k, v in feats.items()},
         "memory_task": {
             "mean_hit_rate":    round(mem_hr, 4),
             "mean_rt":          round(mem_rt, 4),
@@ -2251,8 +2285,10 @@ def page_report():
             "events":     [asdict(e) for e in det.events],
         },
     }
-    fname = os.path.join(RESULTS_DIR,
-        f"lbd_{st.session_state.participant}_{datetime.now().strftime('%Y%m%d_%H%M')}.json")
+    fname = os.path.join(
+        RESULTS_DIR,
+        f"lbd_{st.session_state.participant}_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
+    )
     try:
         with open(fname, "w", encoding="utf-8") as f:
             json.dump(payload, f, indent=2)
@@ -2309,22 +2345,22 @@ def page_report():
             unsafe_allow_html=True)
 
 
-
+# ══════════════════════════════════════════════════════════════════════════════
 # MAIN
-
+# ══════════════════════════════════════════════════════════════════════════════
 def main():
     inject_css()
     init_state()
     dispatch = {
-        "welcome":    page_welcome,
-        "calibration":page_calibration,
-        "mem_intro":  page_mem_intro,
-        "mem_task":   page_mem_task,
-        "sacc_intro": page_sacc_intro,
-        "sacc_task":  page_sacc_task,
-        "report":     page_report,
+        "welcome":     page_welcome,
+        "calibration": page_calibration,
+        "mem_intro":   page_mem_intro,
+        "mem_task":    page_mem_task,
+        "sacc_intro":  page_sacc_intro,
+        "sacc_task":   page_sacc_task,
+        "report":      page_report,
     }
-    fn = dispatch.get(st.session_state.get("page","welcome"))
+    fn = dispatch.get(st.session_state.get("page", "welcome"))
     if fn:
         fn()
     else:
